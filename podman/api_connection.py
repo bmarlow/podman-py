@@ -1,21 +1,25 @@
 """ Provides a Connection to a Podman service. """
+import json
+import logging
 import socket
 import urllib.parse
 from contextlib import AbstractContextManager
 from http import HTTPStatus
 from http.client import HTTPConnection
 
+import podman.containers as containers
 import podman.errors as errors
 import podman.images as images
 import podman.system as system
 
 
 class ApiConnection(HTTPConnection, AbstractContextManager):
-    """ ApiConnection provides a specialized HTTPConnection
-        to a Podman service."""
+    """ApiConnection provides a specialized HTTPConnection
+    to a Podman service."""
 
-    def __init__(self, url, base="/v1.24/libpod", *args,
-                 **kwargs):  # pylint: disable-msg=W1113
+    def __init__(
+        self, url, base="/v1.24/libpod", *args, **kwargs
+    ):  # pylint: disable-msg=W1113
         if url is None or not url:
             raise ValueError("url is required for service connection.")
 
@@ -23,8 +27,11 @@ class ApiConnection(HTTPConnection, AbstractContextManager):
         supported_schemes = ("unix", "ssh")
         uri = urllib.parse.urlparse(url)
         if uri.scheme not in ("unix", "ssh"):
-            raise ValueError("The scheme '{}' is not supported, only {}".format(
-                uri.scheme, supported_schemes))
+            raise ValueError(
+                "The scheme '{}' is not supported, only {}".format(
+                    uri.scheme, supported_schemes
+                )
+            )
         self.uri = uri
         self.base = base
 
@@ -35,25 +42,73 @@ class ApiConnection(HTTPConnection, AbstractContextManager):
             sock.connect(self.uri.path)
             self.sock = sock
         else:
-            raise NotImplementedError("Scheme {} not yet implemented".format(
-                self.uri.scheme))
+            raise NotImplementedError(
+                "Scheme {} not yet implemented".format(self.uri.scheme)
+            )
 
-    def request(self,
-                method,
-                url,
-                body=None,
-                headers=None,
-                *,
-                encode_chunked=False):
+    def delete(self, path, params=None):
+        """Basic DELETE wrapper for requests
+
+        Send a delete request with params added to the url as a query string
+
+        :param path: url part to the call, appended to self.base
+        :param params: optional dictionary of query params added to the request
+        :return: http response object
+        """
+        return self.request("DELETE", self.join(path, params))
+
+    def get(self, path, params=None):
+        """Basic GET wrapper for requests
+
+        Send a get request with params added to the url as a query string
+
+        :param path: url part to the call, appended to self.base
+        :param params: optional dictionary of query params added to the request
+        :return: http response object
+        """
+        return self.request("GET", self.join(path, params))
+
+    def post(self, path, params=None, headers=None, encode=False):
+        """Basic POST wrapper for requests
+
+        Send a POST request with params converted into a urlencoded form to be
+        sent with the post.
+
+        :param path: url part to the call, appended to self.base
+        :param params: optional dictionary of query params added to the post
+                       request as url encoded form data
+        :param headers: optional dictionary of request headers
+        :param encode: flag to indicate if you want the params to be encoded
+                       prior to posting. When set to False, params are posted
+                       directly as the body of the request.
+        :return: http response object
+        """
+        data = params
+        if not headers:
+            headers = {}
+
+        if encode:
+            if (
+                "content-type" not in set(key.lower() for key in headers)
+                and params
+            ):
+                headers["content-type"] = "application/x-www-form-urlencoded"
+            data = urllib.parse.urlencode(params)
+
+        return self.request(
+            "POST", self.join(path), body=data, headers=headers
+        )
+
+    def request(
+        self, method, url, body=None, headers=None, *, encode_chunked=False
+    ):
         """Make request to Podman service."""
         if headers is None:
             headers = {}
 
-        super().request(method,
-                        url,
-                        body,
-                        headers,
-                        encode_chunked=encode_chunked)
+        super().request(
+            method, url, body, headers, encode_chunked=encode_chunked
+        )
         response = super().getresponse()
 
         # Errors are mapped to exceptions
@@ -69,7 +124,20 @@ class ApiConnection(HTTPConnection, AbstractContextManager):
                 ),
                 response,
             )
-        elif HTTPStatus.INTERNAL_SERVER_ERROR >= response.status:
+        elif (
+            response.status >= HTTPStatus.BAD_REQUEST
+            and response.status < HTTPStatus.INTERNAL_SERVER_ERROR
+        ):
+            raise errors.RequestError(
+                "Request {}:{} failed: {}".format(
+                    method,
+                    url,
+                    response.reason
+                    or "Response Status Code {}".format(response.status),
+                ),
+                response,
+            )
+        elif response.status >= HTTPStatus.INTERNAL_SERVER_ERROR:
             raise errors.InternalServerError(
                 "Request {}:{} failed: {}".format(
                     method,
@@ -89,9 +157,17 @@ class ApiConnection(HTTPConnection, AbstractContextManager):
             path = path + "?" + query
         return path
 
-    def quote(self, value):  # pylint: disable=no-self-use
+    @staticmethod
+    def quote(value):
         """Quote value for use in a URL"""
         return urllib.parse.quote(value)
+
+    @staticmethod
+    def raise_not_found(exc, response, exception_type=errors.ImageNotFound):
+        """helper function to raise a not found exception of exception_type"""
+        body = json.loads(response.read())
+        logging.info(body["cause"])
+        raise exception_type(body["message"]) from exc
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -101,6 +177,7 @@ if __name__ == "__main__":
     with ApiConnection("unix:///run/podman/podman.sock") as api:
         print(system.version(api))
         print(images.list_images(api))
+        print(containers.list_containers(api))
 
         try:
             images.inspect(api, "bozo the clown")
